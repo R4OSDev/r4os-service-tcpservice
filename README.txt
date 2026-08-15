@@ -1,0 +1,72 @@
+﻿TCPSVC.R4X
+==========
+
+TCPSVC.R4X ist der TCP-Verbindungsservice.
+
+Seit 0.52.11 unterstuetzt der strukturierte TCP-Servicevertrag zusaetzlich
+`ACCEPT_POLL`: eine nicht-blockierende Accept-Abfrage auf einem bestehenden
+Listener. Dienste wie `RDPSVC.R4X` koennen damit eingehende Verbindungen
+annehmen, ohne ihren eigenen Service-Endpunkt durch lange Accept-Wartefenster
+zu blockieren. Die bisherigen blockierenden `ACCEPT`- und `ACCEPTREAD`-Pfade
+bleiben unveraendert.
+
+Seit 0.53.16 nutzt der Service-Endpoint den queue-basierten R4SYS-Vertrag mit
+vier outstanding Requests und Completion-Wait. `TCPSVC.R4X` bleibt Besitzer
+von TCP-Handles, Listenern, Restart-Cleanup und Retry-Policy; der Kernel
+liefert nur Endpoint-Queue, Wait und Diagnosezaehler.
+
+Seit 0.53.21 kann R4NET TCP-Serviceoperationen als `NetSocketRequest` ueber
+R4SYS-`ioServiceCall` starten, pollen, warten und schliessen. Die normalen
+R4NET-TCP-Sync-Helfer nutzen intern denselben Completion-Pfad; `TCPSVC.R4X`
+bleibt weiterhin Besitzer von Handle-, Listener-, Backpressure- und Cleanup-
+Policy.
+
+Seit 0.55.41 ist `TCP_POLL_RESULT` der verbindliche Readiness-Vertrag fuer
+R4X-Dienste. `pending_rx != 0` bedeutet lesbar, `tx_window != 0` bedeutet
+schreibbar, `would-block` ist ein retrybarer Leerzustand, und terminale
+Lifecycle-Ursachen wie `closed`, `reset`, `peer-gone`, `bad-handle` oder
+`owner-mismatch` beenden SDK-Waits. `SERVMAN STATUS TCPSVC` zeigt den letzten
+Readiness-Snapshot und Zaehler fuer lesbar, schreibbar, would-block und
+terminal.
+
+Seit 0.55.42 besitzt `TCPSVC.R4X` eine bounded Deferred-Completion-Grundlage.
+Ein strukturierter Read, der nur `would-block` erreicht, darf als Pending-
+Operation im Dienst verbleiben; TCPSVC beantwortet weiter andere Service-
+Requests und liefert spaeter per urspruenglicher `request_id` Daten, Timeout
+oder Cancel. Pending-Operationen tragen Owner, Frontend-Handle, Backend-Handle,
+Generation, Deadline und Abbruchgrund. `TCP_CLOSE_RESULT` laeuft nicht mehr
+ueber den potentiell wartenden FIN-Pfad, sondern nutzt einen dokumentierten
+Abort-Fallback, gibt den Frontend-Handle sofort frei und meldet den
+Lifecycle `local-abort`. `SERVMAN STATUS TCPSVC` zeigt `pending=...`,
+Late-Replies, Timeouts, Cancels, Busy und `close_abort`.
+
+Seit 0.55.43 begrenzt `TCPSVC.R4X` deferred Reads pro Owner und pro Frontend-
+Handle und haelt einen Pending-Slot als Reactor-Reserve frei. Dadurch kann
+eine zaehe RDPSVC-Session nicht alle TCPSVC-Deferred-Slots vor SSHD oder
+FTPSVC belegen. Backpressure kommt als klarer `would-block`-Result mit
+Gruenden wie `pending-handle`, `pending-owner` oder `pending-reserve`
+zurueck. Spaete Deferred-Replies nutzen slot-eigene Daten- und
+Antwortpuffer; `SERVMAN STATUS TCPSVC` zeigt zusaetzlich `fair=...`,
+Endpoint-Queue-Druck und letzte/maximale Completion-Ticks.
+
+Projektstruktur seit 0.51.19:
+- `build.zig` baut den Service als eigenes SDK-Projekt.
+- `build.zig.zon` bindet `r4os_sdk` als Paket.
+- `module.R4MF` beschreibt Artefakt, Zielpfad, Imports, Startdaten und Contract.
+
+Build:
+
+    cd Code\System\Services\TcpService
+    ..\..\..\DevTools\Zig\zig.exe build
+
+Ergebnis:
+
+    Code\System\Services\TcpService\zig-out\TCPSVC.R4X
+
+Contract:
+- R4XStart-Entry: `tcpsvc_main`
+- App-Klasse: `service`
+- R4L-Imports: `R4SYS`, `R4NET`
+- Service-Name: `TCPSVC`
+- Standardargumente: `/RUN`
+- Zielpfad im Image: `C:\R4OS\SERVICES\TCPSVC.R4X`
