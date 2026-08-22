@@ -255,42 +255,46 @@ fn runService(app: *const App) i32 {
 
     var state = ServiceState{};
     setLastError(&state, "ready");
-    while (!app.sys.programShouldClose()) {
+    var service_loop = r4os.ServiceLoop.init(app.sys, handle, .{});
+    while (true) {
         const pending_rc = processPending(app, handle, &state);
         if (pending_rc < 0) {
             cleanupService(app, handle, &state, "pending");
             _ = app.sys.serviceEndpointUnregister(handle);
             return pending_rc;
         }
-        const poll = app.sys.serviceEndpointPoll(handle);
-        if (poll < 0) {
-            cleanupService(app, handle, &state, "endpoint");
-            _ = app.sys.serviceEndpointUnregister(handle);
-            return poll;
-        }
-        if (poll > 0) {
-            const request_start = app.sys.ticks();
-            const rc = handleRequest(app, handle, &state);
-            recordRequestTicks(&state, app.sys.ticks() - request_start);
-            if (rc < 0) {
+        const deadline = if (pendingCount(&state) != 0) app.sys.ticks() +| 1 else null;
+        switch (service_loop.wait(deadline)) {
+            .requests => |pending| {
+                const rc = service_loop.drain(pending, handleLoopRequest, .{ app, handle, &state });
+                if (rc >= 0) continue;
                 cleanupService(app, handle, &state, "request");
                 _ = app.sys.serviceEndpointUnregister(handle);
                 return rc;
-            }
-            const completion_rc = processPending(app, handle, &state);
-            if (completion_rc < 0) {
-                cleanupService(app, handle, &state, "completion");
+            },
+            .deadline, .idle => {},
+            .stop => break,
+            .failure => |raw| {
+                cleanupService(app, handle, &state, "endpoint");
                 _ = app.sys.serviceEndpointUnregister(handle);
-                return completion_rc;
-            }
+                return raw;
+            },
         }
-        app.sys.sleepTicks(1);
     }
 
+    service_loop.report(service_name);
     cleanupService(app, handle, &state, "service-stop");
     _ = app.sys.serviceEndpointUnregister(handle);
     app.sys.println("TCPSVC stopped cleanly");
     return 0;
+}
+
+fn handleLoopRequest(app: *const App, handle: u32, state: *ServiceState) i32 {
+    const request_start = app.sys.ticks();
+    const rc = handleRequest(app, handle, state);
+    recordRequestTicks(state, app.sys.ticks() - request_start);
+    if (rc < 0) return rc;
+    return processPending(app, handle, state);
 }
 
 fn handleRequest(app: *const App, handle: u32, state: *ServiceState) i32 {
