@@ -68,6 +68,7 @@ const PendingOperation = struct {
     conn_id: u32 = 0,
     op: u16 = 0,
     requested_bytes: u16 = 0,
+    port: u16 = 0,
     start_ticks: u64 = 0,
     deadline_ticks: u64 = 0,
     reason: [32]u8 = .{0} ** 32,
@@ -139,6 +140,7 @@ const ServiceState = struct {
     deferred_started: u64 = 0,
     deferred_read_started: u64 = 0,
     deferred_write_started: u64 = 0,
+    deferred_accept_started: u64 = 0,
     deferred_completed: u64 = 0,
     deferred_timeouts: u64 = 0,
     deferred_cancelled: u64 = 0,
@@ -213,6 +215,7 @@ var service_status_text: [r4os.abi.service_api_max_payload]u8 = .{0xA5} ** r4os.
 var backend_response_buffer: [r4os.abi.ipc_max_message_size]u8 = .{0xA5} ** r4os.abi.ipc_max_message_size;
 var backend_result_data: [r4os.abi.net_service_tcp_read_max]u8 = .{0xA5} ** r4os.abi.net_service_tcp_read_max;
 var translated_payload: [r4os.abi.net_service_tcp_message_payload_max]u8 = .{0xA5} ** r4os.abi.net_service_tcp_message_payload_max;
+var deadline_payload: [r4os.abi.service_api_max_payload]u8 = .{0xA5} ** r4os.abi.service_api_max_payload;
 var service_reply_payload: [@sizeOf(r4os.abi.NetServiceTcpResult) + r4os.abi.net_service_tcp_read_max]u8 = .{0xA5} ** (@sizeOf(r4os.abi.NetServiceTcpResult) + r4os.abi.net_service_tcp_read_max);
 var service_status_reply: r4os.abi.NetServiceTcpStatus = .{};
 var service_result_reply: r4os.abi.NetServiceTcpResult = .{};
@@ -365,7 +368,7 @@ fn replyTextOperation(app: *const App, handle: u32, request_id: u32, state: *Ser
         state.bad_ops +%= 1;
         return finishReply(state, app.sys.serviceEndpointReply(handle, request_id, r4os.abi.service_api_result_bad_op, "BADOP"));
     }
-    const reply = performOperation(app, state, owner_id, op, request, backend_result_data[0..]);
+    const reply = performOperation(app, state, owner_id, op, request, null, backend_result_data[0..]);
     var buf: [512]u8 = .{0} ** 512;
     var w = Writer{ .out = buf[0..] };
     writeOperationText(&w, &reply.result, reply.data);
@@ -373,19 +376,23 @@ fn replyTextOperation(app: *const App, handle: u32, request_id: u32, state: *Ser
 }
 
 fn replyStructuredOperation(app: *const App, handle: u32, request_id: u32, state: *ServiceState, owner_id: u32, op: u16, request: []const u8) i32 {
-    var reply = performOperation(app, state, owner_id, op, request, backend_result_data[0..]);
-    if (op == r4os.abi.net_service_op_tcp_read_result and shouldDeferRead(&reply.result, request)) {
-        if (startDeferredRead(app, state, request_id, owner_id, request, &reply.result)) return 0;
+    const view = r4os.service_deadline.split(request);
+    var reply = performOperation(app, state, owner_id, op, view.payload, view.deadline_tick, backend_result_data[0..]);
+    if (op == r4os.abi.net_service_op_tcp_read_result and shouldDeferRead(&reply.result, view.payload)) {
+        if (startDeferredRead(app, state, request_id, owner_id, view.payload, view.deadline_tick, &reply.result)) return 0;
     }
-    if (op == r4os.abi.net_service_op_tcp_write_result and shouldDeferWrite(&reply.result, request)) {
-        if (startDeferredWrite(app, state, request_id, owner_id, request, &reply.result)) return 0;
+    if (op == r4os.abi.net_service_op_tcp_write_result and shouldDeferWrite(&reply.result, view.payload)) {
+        if (startDeferredWrite(app, state, request_id, owner_id, view.payload, view.deadline_tick, &reply.result)) return 0;
+    }
+    if (shouldDeferAccept(op, &reply.result, view.payload)) {
+        if (startDeferredAccept(app, state, request_id, owner_id, op, view.payload, view.deadline_tick, &reply.result)) return 0;
     }
     const send_rc = sendStructuredReply(app, handle, request_id, &reply.result, reply.data);
     if (send_rc != r4os.abi.service_api_result_ok) cleanupUndeliveredNewHandle(app, state, op, &reply.result);
     const reply_rc = finishReply(state, send_rc);
     if (reply_rc < 0) return reply_rc;
-    if (reply.result.result == 0 and releasesFrontHandleOp(op) and request.len >= 4) {
-        const cancel_rc = cancelPendingForHandle(app, handle, state, owner_id, readLe32(request, 0), "handle-closed");
+    if (reply.result.result == 0 and releasesFrontHandleOp(op) and view.payload.len >= 4) {
+        const cancel_rc = cancelPendingForHandle(app, handle, state, owner_id, readLe32(view.payload, 0), "handle-closed");
         if (cancel_rc < 0) return cancel_rc;
     }
     return reply_rc;
@@ -472,10 +479,16 @@ fn shouldDeferWrite(result: *const r4os.abi.NetServiceTcpResult, request: []cons
     return isWriteWouldBlockResult(result);
 }
 
-fn startDeferredRead(app: *const App, state: *ServiceState, request_id: u32, owner_id: u32, request: []const u8, initial: *r4os.abi.NetServiceTcpResult) bool {
+fn startDeferredRead(app: *const App, state: *ServiceState, request_id: u32, owner_id: u32, request: []const u8, requested_deadline: ?u64, initial: *r4os.abi.NetServiceTcpResult) bool {
     const front_handle = readLe32(request, 0);
     const lookup = resolveFrontHandle(state, front_handle, owner_id);
     if (!lookup.ok) return false;
+    const now = app.sys.ticks();
+    const deadline = deferredDeadline(app, requested_deadline, deferred_read_timeout_ms);
+    if (now >= deadline) {
+        markDeferredTimeout(initial, front_handle, "read-deadline");
+        return false;
+    }
     if (pendingCountForHandle(state, front_handle, lookup.entry.generation) >= pending_per_handle_max) {
         state.deferred_handle_busy +%= 1;
         recordDeferredBlock(state, .read, owner_id, front_handle, "pending-handle");
@@ -500,8 +513,6 @@ fn startDeferredRead(app: *const App, state: *ServiceState, request_id: u32, own
         markDeferredWouldBlock(initial, front_handle, "pending-full");
         return false;
     };
-    const now = app.sys.ticks();
-    const timeout_ticks = app.sys.ticksFromMilliseconds(deferred_read_timeout_ms);
     state.pending[slot] = .{
         .used = true,
         .kind = .read,
@@ -514,7 +525,7 @@ fn startDeferredRead(app: *const App, state: *ServiceState, request_id: u32, own
         .op = r4os.abi.net_service_op_tcp_read_result,
         .requested_bytes = readLe16(request, 4),
         .start_ticks = now,
-        .deadline_ticks = now + (if (timeout_ticks == 0) 1 else timeout_ticks),
+        .deadline_ticks = deadline,
     };
     copyFixed(state.pending[slot].reason[0..], "read-would-block");
     state.deferred_started +%= 1;
@@ -523,7 +534,7 @@ fn startDeferredRead(app: *const App, state: *ServiceState, request_id: u32, own
     return true;
 }
 
-fn startDeferredWrite(app: *const App, state: *ServiceState, request_id: u32, owner_id: u32, request: []const u8, initial: *r4os.abi.NetServiceTcpResult) bool {
+fn startDeferredWrite(app: *const App, state: *ServiceState, request_id: u32, owner_id: u32, request: []const u8, requested_deadline: ?u64, initial: *r4os.abi.NetServiceTcpResult) bool {
     const front_handle = readLe32(request, 0);
     const payload = request[4..];
     if (payload.len == 0 or payload.len > pending_data_max) {
@@ -532,6 +543,12 @@ fn startDeferredWrite(app: *const App, state: *ServiceState, request_id: u32, ow
     }
     const lookup = resolveFrontHandle(state, front_handle, owner_id);
     if (!lookup.ok) return false;
+    const now = app.sys.ticks();
+    const deadline = deferredDeadline(app, requested_deadline, deferred_write_timeout_ms);
+    if (now >= deadline) {
+        markDeferredTimeout(initial, front_handle, "write-deadline");
+        return false;
+    }
     if (pendingCountForHandle(state, front_handle, lookup.entry.generation) >= pending_per_handle_max) {
         state.deferred_handle_busy +%= 1;
         recordDeferredBlock(state, .write, owner_id, front_handle, "pending-handle");
@@ -556,8 +573,6 @@ fn startDeferredWrite(app: *const App, state: *ServiceState, request_id: u32, ow
         markDeferredWouldBlock(initial, front_handle, "pending-full");
         return false;
     };
-    const now = app.sys.ticks();
-    const timeout_ticks = app.sys.ticksFromMilliseconds(deferred_write_timeout_ms);
     state.pending[slot] = .{
         .used = true,
         .kind = .write,
@@ -570,7 +585,7 @@ fn startDeferredWrite(app: *const App, state: *ServiceState, request_id: u32, ow
         .op = r4os.abi.net_service_op_tcp_write_result,
         .requested_bytes = @intCast(payload.len),
         .start_ticks = now,
-        .deadline_ticks = now + (if (timeout_ticks == 0) 1 else timeout_ticks),
+        .deadline_ticks = deadline,
     };
     copyBytes(state.pending[slot].data[0..payload.len], payload);
     copyFixed(state.pending[slot].reason[0..], "tx-window");
@@ -581,6 +596,62 @@ fn startDeferredWrite(app: *const App, state: *ServiceState, request_id: u32, ow
     return true;
 }
 
+fn shouldDeferAccept(op: u16, result: *const r4os.abi.NetServiceTcpResult, request: []const u8) bool {
+    if (op != r4os.abi.net_service_op_tcp_accept_poll_result or request.len < 2 or readLe16(request, 0) == 0) return false;
+    if (result.result != 0 or result.handle != 0 or (result.flags & r4os.abi.net_service_tcp_flag_handle_valid) != 0) return false;
+    return serviceStatusCode(result.flags) == r4os.abi.net_service_status_would_block or
+        result.lifecycle_cause == r4os.abi.net_service_socket_lifecycle_would_block;
+}
+
+fn startDeferredAccept(app: *const App, state: *ServiceState, request_id: u32, owner_id: u32, op: u16, request: []const u8, requested_deadline: ?u64, initial: *r4os.abi.NetServiceTcpResult) bool {
+    const deadline = requested_deadline orelse return false;
+    const port = readLe16(request, 0);
+    const now = app.sys.ticks();
+    if (now >= deadline) {
+        markDeferredTimeout(initial, 0, "accept-deadline");
+        return false;
+    }
+    if (pendingAcceptForOwner(state, owner_id, port)) {
+        state.deferred_handle_busy +%= 1;
+        recordDeferredBlock(state, .accept, owner_id, 0, "pending-listener");
+        markDeferredWouldBlock(initial, 0, "pending-listener");
+        return false;
+    }
+    if (pendingCountForOwner(state, owner_id) >= pending_per_owner_max) {
+        state.deferred_owner_busy +%= 1;
+        recordDeferredBlock(state, .accept, owner_id, 0, "pending-owner");
+        markDeferredWouldBlock(initial, 0, "pending-owner");
+        return false;
+    }
+    if (pendingCount(state) >= pendingActiveLimit()) {
+        state.deferred_reserved_busy +%= 1;
+        recordDeferredBlock(state, .accept, owner_id, 0, "pending-reserve");
+        markDeferredWouldBlock(initial, 0, "pending-reserve");
+        return false;
+    }
+    const slot = allocatePendingSlot(state) orelse {
+        state.deferred_reserved_busy +%= 1;
+        recordDeferredBlock(state, .accept, owner_id, 0, "pending-full");
+        markDeferredWouldBlock(initial, 0, "pending-full");
+        return false;
+    };
+    state.pending[slot] = .{
+        .used = true,
+        .kind = .accept,
+        .request_id = request_id,
+        .owner_id = owner_id,
+        .port = port,
+        .op = op,
+        .start_ticks = now,
+        .deadline_ticks = deadline,
+    };
+    copyFixed(state.pending[slot].reason[0..], "accept-would-block");
+    state.deferred_started +%= 1;
+    state.deferred_accept_started +%= 1;
+    setLastDeferred(state, .accept, 0, "accept-would-block", 0);
+    return true;
+}
+
 fn processPending(app: *const App, endpoint_handle: u32, state: *ServiceState) i32 {
     var i: usize = 0;
     while (i < state.pending.len) : (i += 1) {
@@ -588,11 +659,35 @@ fn processPending(app: *const App, endpoint_handle: u32, state: *ServiceState) i
         const rc = switch (state.pending[i].kind) {
             .read => processPendingRead(app, endpoint_handle, state, i),
             .write => processPendingWrite(app, endpoint_handle, state, i),
+            .accept => processPendingAccept(app, endpoint_handle, state, i),
             else => completePendingLocal(app, endpoint_handle, state, i, r4os.abi.net_service_result_bad_op, r4os.abi.net_service_status_cancelled, r4os.abi.net_service_socket_lifecycle_local_abort, 0, "pending-cancel", .cancelled),
         };
         if (rc < 0) return rc;
     }
     return 0;
+}
+
+fn processPendingAccept(app: *const App, endpoint_handle: u32, state: *ServiceState, index: usize) i32 {
+    const pending = &state.pending[index];
+    var request: [2]u8 = .{0} ** 2;
+    writeLe16(request[0..], 0, pending.port);
+    var reply = performAccept(app, state, pending.owner_id, pending.op, request[0..], pending.data[0..]);
+    if (shouldDeferAccept(pending.op, &reply.result, request[0..])) {
+        if (pendingExpired(app, pending)) {
+            return completePendingLocal(app, endpoint_handle, state, index, 0, r4os.abi.net_service_status_timeout, r4os.abi.net_service_socket_lifecycle_timeout, r4os.abi.net_service_tcp_flag_timeout, "accept-timeout", .timeout);
+        }
+        return 0;
+    }
+    if (reply.result.handle != 0 and (reply.result.flags & r4os.abi.net_service_tcp_flag_handle_valid) != 0) {
+        pending.front_handle = reply.result.handle;
+        const lookup = resolveFrontHandle(state, reply.result.handle, pending.owner_id);
+        if (lookup.ok) {
+            pending.backend_handle = lookup.entry.backend_handle;
+            pending.generation = lookup.entry.generation;
+            pending.conn_id = lookup.entry.conn_id;
+        }
+    }
+    return completePendingReply(app, endpoint_handle, state, index, &reply.result, reply.data, "accept-complete", .completed);
 }
 
 fn processPendingRead(app: *const App, endpoint_handle: u32, state: *ServiceState, index: usize) i32 {
@@ -713,7 +808,7 @@ fn completePendingLocal(app: *const App, endpoint_handle: u32, state: *ServiceSt
     var out = r4os.abi.NetServiceTcpResult{
         .action = actionForOp(pending.op),
         .result = result_code,
-        .flags = withServiceStatus(extra_flags | r4os.abi.net_service_tcp_flag_handle_valid, service_status),
+        .flags = withServiceStatus(extra_flags, service_status),
         .handle = pending.front_handle,
         .conn_id = pending.conn_id,
         .lifecycle_cause = lifecycle,
@@ -723,6 +818,7 @@ fn completePendingLocal(app: *const App, endpoint_handle: u32, state: *ServiceSt
         .read_max = r4os.abi.net_service_tcp_read_max,
         .local_ip = localIp(app),
     };
+    if (pending.front_handle != 0) out.flags |= r4os.abi.net_service_tcp_flag_handle_valid;
     if (lifecycle != r4os.abi.net_service_socket_lifecycle_unknown) out.flags |= r4os.abi.net_service_tcp_flag_lifecycle_valid;
     if (result_code == 0 and service_status != r4os.abi.net_service_status_failed and service_status != r4os.abi.net_service_status_cancelled) out.flags |= r4os.abi.net_service_tcp_flag_ok;
     copyFixed(out.last_error[0..], reason);
@@ -744,10 +840,12 @@ fn completePendingReply(app: *const App, endpoint_handle: u32, state: *ServiceSt
     const requested_bytes = pending.requested_bytes;
     const request_id = pending.request_id;
     const start_ticks = pending.start_ticks;
+    const op = pending.op;
     if (kind == .write) noteTxWriteResult(state, &out, requested_bytes);
     noteResult(state, &out);
     const payload = structuredReplyPayloadInto(&pending.reply, pending.reply_payload[0..], &out, data);
     const rc = app.sys.serviceEndpointReply(endpoint_handle, request_id, r4os.abi.service_api_result_ok, payload);
+    if (rc != r4os.abi.service_api_result_ok) cleanupUndeliveredNewHandle(app, state, op, &out);
     const elapsed = app.sys.ticks() - start_ticks;
     state.pending[index] = .{};
     return finishPendingReply(state, rc, kind, front_handle, reason, elapsed, finish);
@@ -818,6 +916,15 @@ fn pendingCountForOwner(state: *const ServiceState, owner_id: u32) u32 {
     return count;
 }
 
+fn pendingAcceptForOwner(state: *const ServiceState, owner_id: u32, port: u16) bool {
+    var i: usize = 0;
+    while (i < state.pending.len) : (i += 1) {
+        const pending = state.pending[i];
+        if (pending.used and pending.kind == .accept and pending.port == port and ownerMatches(pending.owner_id, owner_id)) return true;
+    }
+    return false;
+}
+
 fn pendingCount(state: *const ServiceState) u32 {
     var count: u32 = 0;
     var i: usize = 0;
@@ -847,11 +954,31 @@ fn markDeferredWouldBlock(result: *r4os.abi.NetServiceTcpResult, handle: u32, re
     result.bytes = 0;
     result.flags &= ~r4os.abi.net_service_tcp_flag_data;
     result.flags &= ~r4os.abi.net_service_tcp_flag_ok;
-    result.flags |= r4os.abi.net_service_tcp_flag_handle_valid | r4os.abi.net_service_tcp_flag_lifecycle_valid;
+    result.flags |= r4os.abi.net_service_tcp_flag_lifecycle_valid;
+    if (handle != 0) result.flags |= r4os.abi.net_service_tcp_flag_handle_valid;
     result.flags = withServiceStatus(result.flags, r4os.abi.net_service_status_would_block);
     result.service_status = r4os.abi.net_service_status_would_block;
     result.lifecycle_cause = r4os.abi.net_service_socket_lifecycle_would_block;
     copyFixed(result.last_error[0..], reason);
+}
+
+fn markDeferredTimeout(result: *r4os.abi.NetServiceTcpResult, handle: u32, reason: []const u8) void {
+    result.result = 0;
+    result.handle = handle;
+    result.bytes = 0;
+    result.flags &= ~(r4os.abi.net_service_tcp_flag_data | r4os.abi.net_service_tcp_flag_ok | r4os.abi.net_service_tcp_flag_handle_valid);
+    result.flags |= r4os.abi.net_service_tcp_flag_timeout | r4os.abi.net_service_tcp_flag_lifecycle_valid;
+    if (handle != 0) result.flags |= r4os.abi.net_service_tcp_flag_handle_valid;
+    result.flags = withServiceStatus(result.flags, r4os.abi.net_service_status_timeout);
+    result.service_status = r4os.abi.net_service_status_timeout;
+    result.lifecycle_cause = r4os.abi.net_service_socket_lifecycle_timeout;
+    copyFixed(result.last_error[0..], reason);
+}
+
+fn deferredDeadline(app: *const App, requested: ?u64, fallback_ms: u64) u64 {
+    if (requested) |deadline| return deadline;
+    const ticks = app.sys.ticksFromMilliseconds(fallback_ms);
+    return app.sys.ticks() +| (if (ticks == 0) 1 else ticks);
 }
 
 fn setLastDeferred(state: *ServiceState, kind: PendingKind, handle: u32, reason: []const u8, ticks: u64) void {
@@ -862,12 +989,12 @@ fn setLastDeferred(state: *ServiceState, kind: PendingKind, handle: u32, reason:
     copyFixed(state.last_deferred_reason[0..], reason);
 }
 
-fn performOperation(app: *const App, state: *ServiceState, owner_id: u32, op: u16, request: []const u8, data_out: []u8) TcpReply {
+fn performOperation(app: *const App, state: *ServiceState, owner_id: u32, op: u16, request: []const u8, deadline_tick: ?u64, data_out: []u8) TcpReply {
     state.action_requests +%= 1;
     switch (op) {
         r4os.abi.net_service_op_tcp_connect_result => {
             state.connect_requests +%= 1;
-            return performConnect(app, state, owner_id, op, request, data_out);
+            return performConnect(app, state, owner_id, op, request, deadline_tick, data_out);
         },
         r4os.abi.net_service_op_tcp_write_result => {
             state.write_requests +%= 1;
@@ -908,8 +1035,8 @@ fn performOperation(app: *const App, state: *ServiceState, owner_id: u32, op: u1
     }
 }
 
-fn performConnect(app: *const App, state: *ServiceState, owner_id: u32, op: u16, request: []const u8, data_out: []u8) TcpReply {
-    var reply = backendResult(app, op, request, data_out) orelse return backendError(app, state, op, "backend");
+fn performConnect(app: *const App, state: *ServiceState, owner_id: u32, op: u16, request: []const u8, deadline_tick: ?u64, data_out: []u8) TcpReply {
+    var reply = backendResultWithDeadline(app, op, request, deadline_tick, data_out) orelse return backendError(app, state, op, "backend");
     if (reply.result.result == 0 and (reply.result.flags & r4os.abi.net_service_tcp_flag_handle_valid) != 0) {
         const backend_handle = reply.result.handle;
         const front = allocateFrontHandle(state, owner_id, backend_handle, reply.result.conn_id) orelse {
@@ -1162,6 +1289,12 @@ fn backendResult(app: *const App, op: u16, request: []const u8, data_out: []u8) 
         copyBytes(data_out[0..data_len], available[0..data_len]);
     }
     return .{ .result = result, .data = data_out[0..data_len] };
+}
+
+fn backendResultWithDeadline(app: *const App, op: u16, request: []const u8, deadline_tick: ?u64, data_out: []u8) ?TcpReply {
+    const deadline = deadline_tick orelse return backendResult(app, op, request, data_out);
+    const payload = r4os.service_deadline.append(deadline_payload[0..], request, deadline) orelse return null;
+    return backendResult(app, op, payload, data_out);
 }
 
 fn pollBackendHandle(app: *const App, backend_handle: u32, data_out: []u8) ?TcpReply {
@@ -2165,27 +2298,27 @@ fn localContractSelfTest(app: *const App) bool {
         .lifecycle_cause = r4os.abi.net_service_socket_lifecycle_would_block,
     };
     if (!shouldDeferRead(&would_block, read_request[0..])) return localContractFail(app, 10);
-    if (!startDeferredRead(app, &state, 1234, 11, read_request[0..], &would_block)) return localContractFail(app, 11);
+    if (!startDeferredRead(app, &state, 1234, 11, read_request[0..], null, &would_block)) return localContractFail(app, 11);
     if (pendingCount(&state) != 1 or !hasPendingForHandle(&state, front, ok_lookup.entry.generation)) return localContractFail(app, 12);
-    if (startDeferredRead(app, &state, 1235, 11, read_request[0..], &would_block)) return localContractFail(app, 13);
+    if (startDeferredRead(app, &state, 1235, 11, read_request[0..], null, &would_block)) return localContractFail(app, 13);
     if (state.deferred_handle_busy == 0 or serviceStatusCode(would_block.flags) != r4os.abi.net_service_status_would_block) return localContractFail(app, 14);
     writeLe32(read_request[0..], 0, front_b);
-    if (!startDeferredRead(app, &state, 1236, 11, read_request[0..], &would_block)) return localContractFail(app, 15);
+    if (!startDeferredRead(app, &state, 1236, 11, read_request[0..], null, &would_block)) return localContractFail(app, 15);
     // 0.56.31-Triage: der Test war auf pending_per_owner_max=2 kalibriert;
     // seit der Erhoehung auf 4 wird hier bis zum echten Limit aufgefuellt.
     var fill_seq: u32 = 1240;
     while (pendingCountForOwner(&state, 11) < pending_per_owner_max) {
         const filler = allocateFrontHandle(&state, 11, 50 +% fill_seq, 90 +% fill_seq) orelse return localContractFail(app, 39);
         writeLe32(read_request[0..], 0, filler);
-        if (!startDeferredRead(app, &state, fill_seq, 11, read_request[0..], &would_block)) return localContractFail(app, 40);
+        if (!startDeferredRead(app, &state, fill_seq, 11, read_request[0..], null, &would_block)) return localContractFail(app, 40);
         fill_seq += 1;
     }
     if (pendingCountForOwner(&state, 11) != pending_per_owner_max) return localContractFail(app, 16);
     writeLe32(read_request[0..], 0, front_c);
-    if (startDeferredRead(app, &state, 1237, 11, read_request[0..], &would_block)) return localContractFail(app, 17);
+    if (startDeferredRead(app, &state, 1237, 11, read_request[0..], null, &would_block)) return localContractFail(app, 17);
     if (state.deferred_owner_busy == 0 or !contains(spanZ(would_block.last_error[0..]), "owner")) return localContractFail(app, 18);
     writeLe32(read_request[0..], 0, front_other);
-    if (!startDeferredRead(app, &state, 1238, 22, read_request[0..], &would_block)) return localContractFail(app, 19);
+    if (!startDeferredRead(app, &state, 1238, 22, read_request[0..], null, &would_block)) return localContractFail(app, 19);
     // 0.56.31-Triage: das globale Aktiv-Limit ist unabhaengig vom
     // Owner-Limit gewachsen - mit weiteren Owner-22-Handles bis zum
     // pendingActiveLimit auffuellen, damit der Global-Busy-Fall greift.
@@ -2193,12 +2326,12 @@ fn localContractSelfTest(app: *const App) bool {
     while (pendingCount(&state) < pendingActiveLimit() and pendingCountForOwner(&state, 22) < pending_per_owner_max) {
         const filler22 = allocateFrontHandle(&state, 22, 60 +% fill22_seq, 120 +% fill22_seq) orelse return localContractFail(app, 41);
         writeLe32(read_request[0..], 0, filler22);
-        if (!startDeferredRead(app, &state, fill22_seq, 22, read_request[0..], &would_block)) return localContractFail(app, 42);
+        if (!startDeferredRead(app, &state, fill22_seq, 22, read_request[0..], null, &would_block)) return localContractFail(app, 42);
         fill22_seq += 1;
     }
     if (pendingCount(&state) != pendingActiveLimit()) return localContractFail(app, 20);
     writeLe32(read_request[0..], 0, front_reserve);
-    if (startDeferredRead(app, &state, 1239, 22, read_request[0..], &would_block)) return localContractFail(app, 21);
+    if (startDeferredRead(app, &state, 1239, 22, read_request[0..], null, &would_block)) return localContractFail(app, 21);
     if (state.deferred_reserved_busy == 0 or state.deferred_blocked < 3) return localContractFail(app, 22);
     if (spanZ(state.pending[0].reason[0..]).len == 0 or state.pending[0].reply_payload.len != pending_reply_payload_max) return localContractFail(app, 23);
     const payload_result = r4os.abi.NetServiceTcpResult{
@@ -2223,7 +2356,7 @@ fn localContractSelfTest(app: *const App) bool {
         .lifecycle_cause = r4os.abi.net_service_socket_lifecycle_would_block,
     };
     if (!shouldDeferWrite(&write_block, write_request[0..])) return localContractFail(app, 25);
-    if (!startDeferredWrite(app, &state, 1240, 11, write_request[0..], &write_block)) return localContractFail(app, 26);
+    if (!startDeferredWrite(app, &state, 1240, 11, write_request[0..], null, &write_block)) return localContractFail(app, 26);
     if (pendingCount(&state) != 1 or state.pending[0].kind != .write or state.pending[0].requested_bytes != 8) return localContractFail(app, 27);
     if (!contains(state.pending[0].data[0..8], "write-ok")) return localContractFail(app, 28);
     if (plannedWriteLength(64, 16) != 16 or plannedWriteLength(64, 0) != 0) return localContractFail(app, 29);
@@ -2242,6 +2375,26 @@ fn localContractSelfTest(app: *const App) bool {
     if (state.tx_partial_writes == 0 or state.tx_write_completions == 0 or state.tx_write_retransmits == 0) return localContractFail(app, 30);
     pi = 0;
     while (pi < state.pending.len) : (pi += 1) state.pending[pi] = .{};
+
+    var accept_request: [2]u8 = .{0} ** 2;
+    writeLe16(accept_request[0..], 0, 65044);
+    var accept_block = r4os.abi.NetServiceTcpResult{
+        .action = r4os.abi.net_service_tcp_action_accept,
+        .result = 0,
+        .flags = withServiceStatus(0, r4os.abi.net_service_status_would_block),
+        .lifecycle_cause = r4os.abi.net_service_socket_lifecycle_would_block,
+    };
+    if (!shouldDeferAccept(r4os.abi.net_service_op_tcp_accept_poll_result, &accept_block, accept_request[0..])) return localContractFail(app, 43);
+    const accept_deadline = app.sys.ticks() +| 10;
+    if (!startDeferredAccept(app, &state, 1260, 11, r4os.abi.net_service_op_tcp_accept_poll_result, accept_request[0..], accept_deadline, &accept_block)) return localContractFail(app, 44);
+    if (pendingCount(&state) != 1 or state.pending[0].kind != .accept or state.pending[0].port != 65044) return localContractFail(app, 45);
+    if (startDeferredAccept(app, &state, 1261, 11, r4os.abi.net_service_op_tcp_accept_poll_result, accept_request[0..], accept_deadline, &accept_block)) return localContractFail(app, 46);
+    pi = 0;
+    while (pi < state.pending.len) : (pi += 1) state.pending[pi] = .{};
+    var expired_accept = accept_block;
+    if (startDeferredAccept(app, &state, 1262, 11, r4os.abi.net_service_op_tcp_accept_poll_result, accept_request[0..], app.sys.ticks(), &expired_accept)) return localContractFail(app, 47);
+    if (serviceStatusCode(expired_accept.flags) != r4os.abi.net_service_status_timeout or (expired_accept.flags & r4os.abi.net_service_tcp_flag_timeout) == 0) return localContractFail(app, 48);
+
     var hi: usize = 0;
     while (hi < state.handles.len) : (hi += 1) state.handles[hi] = .{};
     if (frontHandleCount(&state) != 0) return localContractFail(app, 31);
