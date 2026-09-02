@@ -34,11 +34,16 @@ Ein strukturierter Read, der nur `would-block` erreicht, darf als Pending-
 Operation im Dienst verbleiben; TCPSVC beantwortet weiter andere Service-
 Requests und liefert spaeter per urspruenglicher `request_id` Daten, Timeout
 oder Cancel. Pending-Operationen tragen Owner, Frontend-Handle, Backend-Handle,
-Generation, Deadline und Abbruchgrund. `TCP_CLOSE_RESULT` laeuft nicht mehr
-ueber den potentiell wartenden FIN-Pfad, sondern nutzt einen dokumentierten
-Abort-Fallback, gibt den Frontend-Handle sofort frei und meldet den
-Lifecycle `local-abort`. `SERVMAN STATUS TCPSVC` zeigt `pending=...`,
-Late-Replies, Timeouts, Cancels, Busy und `close_abort`.
+Generation, Deadline und Abbruchgrund. `SERVMAN STATUS TCPSVC` zeigt
+`pending=...`, Late-Replies, Timeouts, Cancels und Busy.
+
+Seit 0.74.3 startet `TCP_CLOSE_RESULT` wieder den regulaeren TCP-FIN-Abschluss.
+Der Kernelpfad ist dabei nicht blockierend: Noch unbestaetigte Nutzdaten
+bleiben bis zum ACK im Verbindungszustand, erst danach wird FIN gesendet.
+Retransmit und begrenztes Reaping laufen im Netzwerk-Task weiter, waehrend
+TCPSVC Frontend- und Backend-Handle sofort freigeben kann. `close_abort`
+zaehlt nur noch den Fehlerfallback, falls der regulaere Close nicht gestartet
+werden konnte.
 
 Seit 0.55.43 begrenzt `TCPSVC.R4X` deferred Reads pro Owner und pro Frontend-
 Handle und haelt einen Pending-Slot als Reactor-Reserve frei. Dadurch kann

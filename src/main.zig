@@ -1138,17 +1138,29 @@ fn performCloseOperation(app: *const App, state: *ServiceState, owner_id: u32, o
     }
     if (!lookup.ok) return localError(app, state, op, front_handle, lookup.result, lookup.last_error);
     const translated = translateHandlePayload(request, lookup.entry.backend_handle) orelse return localError(app, state, op, front_handle, r4os.abi.net_service_result_bad_request, "too-large");
-    state.close_abort_fallbacks +%= 1;
-    var reply = backendResult(app, r4os.abi.net_service_op_tcp_abort_result, translated, data_out) orelse {
+    var reply = backendResult(app, r4os.abi.net_service_op_tcp_close_result, translated, data_out) orelse {
+        state.close_abort_fallbacks +%= 1;
+        closeBackendHandle(app, lookup.entry.backend_handle);
         releaseFrontHandleAt(state, lookup.index);
-        return backendError(app, state, op, "close-abort-backend");
+        return backendError(app, state, op, "close-backend");
     };
+
+    if (reply.result.result != 0) {
+        state.close_abort_fallbacks +%= 1;
+        if (backendResult(app, r4os.abi.net_service_op_tcp_abort_result, translated, data_out)) |fallback| {
+            if (fallback.result.result == 0) {
+                reply = fallback;
+                setTcpLifecycle(&reply.result, r4os.abi.net_service_socket_lifecycle_local_abort);
+                copyFixed(reply.result.last_error[0..], "close-abort-fallback");
+            }
+        }
+    }
+
     releaseFrontHandleAt(state, lookup.index);
     reply.result.action = r4os.abi.net_service_tcp_action_close;
     reply.result.handle = front_handle;
     reply.result.conn_id = if (reply.result.conn_id != 0) reply.result.conn_id else lookup.entry.conn_id;
     reply.result.flags |= r4os.abi.net_service_tcp_flag_handle_valid;
-    setTcpLifecycle(&reply.result, r4os.abi.net_service_socket_lifecycle_local_abort);
     if (reply.result.result == 0) {
         reply.result.flags |= r4os.abi.net_service_tcp_flag_ok;
         reply.result.flags = withServiceStatus(reply.result.flags, r4os.abi.net_service_status_ok);
@@ -1157,7 +1169,6 @@ fn performCloseOperation(app: *const App, state: *ServiceState, owner_id: u32, o
         reply.result.flags = withServiceStatus(reply.result.flags, r4os.abi.net_service_status_failed);
         reply.result.service_status = r4os.abi.net_service_status_failed;
     }
-    copyFixed(reply.result.last_error[0..], "close-abort-fallback");
     state.last_handle = front_handle;
     state.last_backend_handle = lookup.entry.backend_handle;
     noteResult(state, &reply.result);
