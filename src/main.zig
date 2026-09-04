@@ -175,6 +175,15 @@ const ServiceState = struct {
     tx_write_timeouts: u64 = 0,
     tx_write_terminal: u64 = 0,
     tx_write_retransmits: u64 = 0,
+    tx_performance_samples: u64 = 0,
+    tx_wire_segments: u64 = 0,
+    tx_wire_bytes: u64 = 0,
+    last_outstanding_segments: u32 = 0,
+    last_outstanding_bytes: u32 = 0,
+    last_pure_ack_tx: u64 = 0,
+    last_adapter_poll_rounds: u64 = 0,
+    last_service_poll_requests: u64 = 0,
+    last_service_poll_skips: u64 = 0,
     last_write_handle: u32 = 0,
     last_write_requested: u32 = 0,
     last_write_written: u32 = 0,
@@ -758,8 +767,7 @@ fn processPendingWrite(app: *const App, endpoint_handle: u32, state: *ServiceSta
         return completePendingReply(app, endpoint_handle, state, index, &out, "", "write-terminal", .cancelled);
     }
 
-    const planned_len = plannedWriteLength(@intCast(pending.requested_bytes), poll.result.tx_window);
-    if (planned_len == 0) {
+    if (poll.result.tx_window == 0) {
         state.tx_window_zero +%= 1;
         if (pendingExpired(app, pending)) {
             state.tx_write_timeouts +%= 1;
@@ -768,7 +776,7 @@ fn processPendingWrite(app: *const App, endpoint_handle: u32, state: *ServiceSta
         return 0;
     }
 
-    const write_payload = writeBackendPayload(pending.backend_handle, pending.data[0..planned_len]) orelse {
+    const write_payload = writeBackendPayload(pending.backend_handle, pending.data[0..pending.requested_bytes]) orelse {
         return completePendingLocal(app, endpoint_handle, state, index, r4os.abi.net_service_result_bad_request, r4os.abi.net_service_status_failed, r4os.abi.net_service_socket_lifecycle_bad_handle, 0, "too-large", .cancelled);
     };
     var reply = backendResult(app, r4os.abi.net_service_op_tcp_write_result, write_payload, pending.data[0..]) orelse {
@@ -1070,29 +1078,11 @@ fn performWriteOperation(app: *const App, state: *ServiceState, owner_id: u32, o
         return out;
     }
 
-    var poll = pollBackendHandle(app, lookup.entry.backend_handle, data_out) orelse return backendError(app, state, op, "backend");
-    rewriteForFrontHandle(&poll.result, front_handle, lookup.entry.conn_id);
-    noteReadiness(state, &poll.result);
-    if (tcpLifecycleTerminal(poll.result.lifecycle_cause)) {
-        var out = poll.result;
-        out.action = r4os.abi.net_service_tcp_action_write;
-        if (out.result == 0) out.result = r4os.abi.tcp_result_no_connection;
-        out.flags &= ~r4os.abi.net_service_tcp_flag_ok;
-        out.flags = withServiceStatus(out.flags | r4os.abi.net_service_tcp_flag_lifecycle_valid, r4os.abi.net_service_status_failed);
-        out.service_status = r4os.abi.net_service_status_failed;
-        out.requested_bytes = @intCast(requested_len);
-        if (spanZ(out.last_error[0..]).len == 0) copyFixed(out.last_error[0..], "write-terminal");
-        noteTxWriteResult(state, &out, @intCast(requested_len));
-        noteResult(state, &out);
-        return .{ .result = out };
-    }
-
-    const planned_len = plannedWriteLength(requested_len, poll.result.tx_window);
-    if (planned_len == 0) {
-        return writeWouldBlockReply(app, state, front_handle, lookup.entry.conn_id, @intCast(requested_len), &poll.result, "tx-window");
-    }
-
-    const translated = writeBackendPayload(lookup.entry.backend_handle, request[4 .. 4 + planned_len]) orelse return localError(app, state, op, front_handle, r4os.abi.net_service_result_bad_request, "too-large");
+    // Optimistic write: the kernel burst planner already owns the current
+    // remote-window and catalog limits. A successful write therefore avoids
+    // the historical readiness poll; only a real would-block result enters
+    // the deferred poll path.
+    const translated = writeBackendPayload(lookup.entry.backend_handle, request[4 .. 4 + requested_len]) orelse return localError(app, state, op, front_handle, r4os.abi.net_service_result_bad_request, "too-large");
     var reply = backendResult(app, op, translated, data_out) orelse return backendError(app, state, op, "backend");
     rewriteForFrontHandle(&reply.result, front_handle, lookup.entry.conn_id);
     reply.result.requested_bytes = @intCast(requested_len);
@@ -1332,6 +1322,25 @@ fn plannedWriteLength(requested_len: usize, tx_window: u32) usize {
     return @min(@min(requested_len, r4os.abi.net_service_tcp_write_max), @as(usize, @intCast(tx_window)));
 }
 
+fn tcpPerformanceSnapshot(app: *const App) ?r4os.abi.TcpPerformanceInfo {
+    var info: r4os.abi.TcpPerformanceInfo = .{};
+    if (app.net.tcpPerformance(&info) <= 0) return null;
+    return info;
+}
+
+fn refreshTcpPerformance(app: *const App, state: *ServiceState) void {
+    const after = tcpPerformanceSnapshot(app) orelse return;
+    state.tx_performance_samples +%= 1;
+    state.tx_wire_segments = after.write_segments;
+    state.tx_wire_bytes = after.write_completed_bytes;
+    state.last_outstanding_segments = after.outstanding_segments;
+    state.last_outstanding_bytes = after.outstanding_bytes;
+    state.last_pure_ack_tx = after.pure_ack_tx;
+    state.last_adapter_poll_rounds = after.adapter_poll_rounds;
+    state.last_service_poll_requests = after.service_poll_requests;
+    state.last_service_poll_skips = after.service_poll_skips;
+}
+
 fn isWriteWouldBlockResult(result: *const r4os.abi.NetServiceTcpResult) bool {
     if (result.result != 0) return false;
     if (result.bytes != 0) return false;
@@ -1459,6 +1468,7 @@ fn localOkListener(app: *const App, state: *ServiceState, op: u16, port: u16, re
 
 fn makeStatus(app: *const App, state: *ServiceState, owner_id: u32) r4os.abi.NetServiceTcpStatus {
     refreshEndpointPressure(app, state);
+    refreshTcpPerformance(app, state);
     var out = r4os.abi.NetServiceTcpStatus{};
     if (!backendStatus(app, &out)) {
         out.max_connections = 0;
@@ -1647,6 +1657,24 @@ fn writeStatusText(w: *Writer, state: *const ServiceState, status: *const r4os.a
     w.num(state.tx_write_terminal);
     w.text(",retx/");
     w.num(state.tx_write_retransmits);
+    w.text(",wire_seg/");
+    w.num(state.tx_wire_segments);
+    w.text(",wire_bytes/");
+    w.num(state.tx_wire_bytes);
+    w.text(",out_seg/");
+    w.num(state.last_outstanding_segments);
+    w.text(",out_bytes/");
+    w.num(state.last_outstanding_bytes);
+    w.text(",pure_ack/");
+    w.num(state.last_pure_ack_tx);
+    w.text(",poll_rounds/");
+    w.num(state.last_adapter_poll_rounds);
+    w.text(",poll_skip/");
+    w.num(state.last_service_poll_skips);
+    w.text("/");
+    w.num(state.last_service_poll_requests);
+    w.text(",perf_samples/");
+    w.num(state.tx_performance_samples);
     w.text(",handle/");
     w.num(state.last_write_handle);
     w.text(",req/");
@@ -2371,6 +2399,12 @@ fn localContractSelfTest(app: *const App) bool {
     if (pendingCount(&state) != 1 or state.pending[0].kind != .write or state.pending[0].requested_bytes != 8) return localContractFail(app, 27);
     if (!contains(state.pending[0].data[0..8], "write-ok")) return localContractFail(app, 28);
     if (plannedWriteLength(64, 16) != 16 or plannedWriteLength(64, 0) != 0) return localContractFail(app, 29);
+    const performance = tcpPerformanceSnapshot(app) orelse return localContractFail(app, 55);
+    if (performance.local_mss != 1460) return localContractFail(app, 56);
+    const full_write_segments = (r4os.abi.net_service_tcp_write_max + performance.local_mss - 1) / performance.local_mss;
+    if (full_write_segments != 3) return localContractFail(app, 56);
+    if (@as(u64, performance.catalog_capacity) * performance.local_mss < 65_535) return localContractFail(app, 57);
+    if (performance.delayed_ack_ms == 0 or performance.delayed_ack_ms > 500) return localContractFail(app, 58);
     var write_done = r4os.abi.NetServiceTcpResult{
         .action = r4os.abi.net_service_tcp_action_write,
         .result = 0,
