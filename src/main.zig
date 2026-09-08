@@ -840,7 +840,8 @@ fn completePendingReply(app: *const App, endpoint_handle: u32, state: *ServiceSt
     out.handle = pending.front_handle;
     out.conn_id = if (out.conn_id != 0) out.conn_id else pending.conn_id;
     if (pending.front_handle != 0) out.flags |= r4os.abi.net_service_tcp_flag_handle_valid;
-    if ((out.flags & r4os.abi.net_service_tcp_flag_data) == 0) out.bytes = 0;
+    // Write progress has no response body and is independent of DATA.
+    if (pending.kind != .write and (out.flags & r4os.abi.net_service_tcp_flag_data) == 0) out.bytes = 0;
     if (spanZ(out.last_error[0..]).len == 0) copyFixed(out.last_error[0..], reason);
 
     const kind = pending.kind;
