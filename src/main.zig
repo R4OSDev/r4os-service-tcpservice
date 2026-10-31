@@ -489,6 +489,7 @@ fn shouldDeferWrite(result: *const r4os.abi.NetServiceTcpResult, request: []cons
 }
 
 fn startDeferredRead(app: *const App, state: *ServiceState, request_id: u32, owner_id: u32, request: []const u8, requested_deadline: ?u64, initial: *r4os.abi.NetServiceTcpResult) bool {
+    if (requested_deadline == r4os.service_deadline.tcp_poll_tick) return false;
     const front_handle = readLe32(request, 0);
     const lookup = resolveFrontHandle(state, front_handle, owner_id);
     if (!lookup.ok) return false;
@@ -544,6 +545,7 @@ fn startDeferredRead(app: *const App, state: *ServiceState, request_id: u32, own
 }
 
 fn startDeferredWrite(app: *const App, state: *ServiceState, request_id: u32, owner_id: u32, request: []const u8, requested_deadline: ?u64, initial: *r4os.abi.NetServiceTcpResult) bool {
+    if (requested_deadline == r4os.service_deadline.tcp_poll_tick) return false;
     const front_handle = readLe32(request, 0);
     const payload = request[4..];
     if (payload.len == 0 or payload.len > pending_data_max) {
@@ -613,6 +615,7 @@ fn shouldDeferAccept(op: u16, result: *const r4os.abi.NetServiceTcpResult, reque
 }
 
 fn startDeferredAccept(app: *const App, state: *ServiceState, request_id: u32, owner_id: u32, op: u16, request: []const u8, requested_deadline: ?u64, initial: *r4os.abi.NetServiceTcpResult) bool {
+    if (requested_deadline == r4os.service_deadline.tcp_poll_tick) return false;
     const deadline = requested_deadline orelse return false;
     const port = readLe16(request, 0);
     const now = app.sys.ticks();
@@ -678,6 +681,9 @@ fn processPending(app: *const App, endpoint_handle: u32, state: *ServiceState) i
 
 fn processPendingAccept(app: *const App, endpoint_handle: u32, state: *ServiceState, index: usize) i32 {
     const pending = &state.pending[index];
+    if (pendingExpired(app, pending)) {
+        return completePendingLocal(app, endpoint_handle, state, index, 0, r4os.abi.net_service_status_timeout, r4os.abi.net_service_socket_lifecycle_timeout, r4os.abi.net_service_tcp_flag_timeout, "operation-deadline", .timeout);
+    }
     var request: [2]u8 = .{0} ** 2;
     writeLe16(request[0..], 0, pending.port);
     var reply = performAccept(app, state, pending.owner_id, pending.op, request[0..], pending.data[0..]);
@@ -701,6 +707,9 @@ fn processPendingAccept(app: *const App, endpoint_handle: u32, state: *ServiceSt
 
 fn processPendingRead(app: *const App, endpoint_handle: u32, state: *ServiceState, index: usize) i32 {
     const pending = &state.pending[index];
+    if (pendingExpired(app, pending)) {
+        return completePendingLocal(app, endpoint_handle, state, index, 0, r4os.abi.net_service_status_timeout, r4os.abi.net_service_socket_lifecycle_timeout, r4os.abi.net_service_tcp_flag_timeout, "operation-deadline", .timeout);
+    }
     const lookup = resolveFrontHandle(state, pending.front_handle, pending.owner_id);
     if (!lookup.ok or lookup.entry.generation != pending.generation or lookup.entry.backend_handle != pending.backend_handle) {
         return completePendingLocal(app, endpoint_handle, state, index, r4os.abi.tcp_result_no_connection, r4os.abi.net_service_status_cancelled, r4os.abi.net_service_socket_lifecycle_bad_handle, 0, "pending-stale", .cancelled);
@@ -744,6 +753,9 @@ fn processPendingRead(app: *const App, endpoint_handle: u32, state: *ServiceStat
 
 fn processPendingWrite(app: *const App, endpoint_handle: u32, state: *ServiceState, index: usize) i32 {
     const pending = &state.pending[index];
+    if (pendingExpired(app, pending)) {
+        return completePendingLocal(app, endpoint_handle, state, index, 0, r4os.abi.net_service_status_timeout, r4os.abi.net_service_socket_lifecycle_timeout, r4os.abi.net_service_tcp_flag_timeout, "operation-deadline", .timeout);
+    }
     const lookup = resolveFrontHandle(state, pending.front_handle, pending.owner_id);
     if (!lookup.ok or lookup.entry.generation != pending.generation or lookup.entry.backend_handle != pending.backend_handle) {
         return completePendingLocal(app, endpoint_handle, state, index, r4os.abi.tcp_result_no_connection, r4os.abi.net_service_status_cancelled, r4os.abi.net_service_socket_lifecycle_bad_handle, 0, "pending-stale", .cancelled);
@@ -998,8 +1010,26 @@ fn setLastDeferred(state: *ServiceState, kind: PendingKind, handle: u32, reason:
     copyFixed(state.last_deferred_reason[0..], reason);
 }
 
+// The deadline controls admission, not rollback of an effect already started.
+// Zero is the explicit TCPSVC nonblocking sentinel; legacy missing suffixes
+// retain their existing policy. Poll must never create a deferred operation.
+fn deadlineAdmission(app: *const App, op: u16, deadline_tick: ?u64) ?TcpReply {
+    const deadline = deadline_tick orelse return null;
+    if (deadline == r4os.service_deadline.tcp_poll_tick) {
+        if (op != r4os.abi.net_service_op_tcp_connect_result) return null;
+        var out = r4os.abi.NetServiceTcpResult{ .action = actionForOp(op) };
+        markDeferredWouldBlock(&out, 0, "connect-poll");
+        return .{ .result = out };
+    }
+    if (deadline == r4os.service_deadline.forever_tick or app.sys.ticks() < deadline) return null;
+    var out = r4os.abi.NetServiceTcpResult{ .action = actionForOp(op) };
+    markDeferredTimeout(&out, 0, "operation-deadline");
+    return .{ .result = out };
+}
+
 fn performOperation(app: *const App, state: *ServiceState, owner_id: u32, op: u16, request: []const u8, deadline_tick: ?u64, data_out: []u8) TcpReply {
     state.action_requests +%= 1;
+    if (deadlineAdmission(app, op, deadline_tick)) |reply| return reply;
     switch (op) {
         r4os.abi.net_service_op_tcp_connect_result => {
             state.connect_requests +%= 1;

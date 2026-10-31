@@ -75,3 +75,23 @@ Contract:
 - Service-Name: `TCPSVC`
 - Standardargumente: `/RUN`
 - Zielpfad im Image: `C:\R4OS\SERVICES\TCPSVC.R4X`
+
+Seit 0.88.79: TCPSVC0.1.9 verwendet SDK0.64.122/Contract0.64.65.
+Der bestehende24-Byte-ServiceDeadlineFooter setzt eine absolute Logicaltick-
+Frist. Sentinel0 erlaubt genau einen nichtblockierenden Versuch, MAX bleibt
+Forever. Endliche abgelaufene Fristen werden vor Backendzulassung und vor
+jedem naechsten Deferred-Read/Write/Accept abgewiesen. Bereits zugelassene
+Wirkung wird nicht zurueckgerollt. Ohne Footer gelten die bisherigen
+Read/Write50ms-/Accept-/Connect-RTO-Regeln. Keine neuen Kernelhooks.
+Die hoeheren C/Rust/Zig-Fassaden belasten dieselbe Frist schon vor Discovery
+und unterscheiden fehlende Antwort von bestaetigten Bytes. Bytes quittieren
+Backendannahme, keinen entfernten Peer-ACK. Keine automatischen Wiederholungen
+unbekannter nichtidempotenter Wirkungen. Technische APIs behalten getrennte
+Operations-/Completion-/Drainbudgets. Neue Lieferpartner gemeinsam verwenden.
+
+Gezielte Abnahme: drei Hostfaelle, ein KVM4-Softwaregast mit drei oeffentlichen
+Sprachverbrauchern am identischen kontrollierten Peer. Lokaler20ms-Timeout
+vor800ms-Peerantwort, spaeter16Bvoll, dreimalExit0/Closequittung/PeerEOF, keine
+doppelten Writes; nach regulaerem3s-Nachlauf keine eigene Zielverbindung mehr.
+Das ist kein allgemeiner NIC-/DMA-/Heap-Freigabebeweis und keine Nexus-
+TLS-Ursachenzuordnung. Details im zentralen Docs/API/ServiceNetworkFacade.md.
