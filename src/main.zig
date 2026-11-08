@@ -1,4 +1,6 @@
 const r4os = @import("r4os");
+const std = @import("std");
+const network = r4os.network_family.common;
 
 const service_name = "TCPSVC";
 const selftest_arg = "/SELFTEST";
@@ -20,6 +22,9 @@ const deferred_write_timeout_ms: u64 = 50;
 const owner_mismatch_result: i32 = -4;
 
 const FrontHandle = struct {
+    typed_generation: u64 = 0,
+    typed_owner: r4os.abi.ProgramProcessHandle = .{},
+    typed_endpoint: r4os.abi.NetworkEndpoint = .{},
     used: bool = false,
     handle: u32 = 0,
     backend_handle: u32 = 0,
@@ -78,6 +83,10 @@ const PendingOperation = struct {
 };
 
 const ServiceState = struct {
+    provider: u64 = 0,
+    next_typed_generation: u64 = 1,
+    typed_count: u32 = 0,
+    typed_sweep_tick: u64 = 0,
     requests: u64 = 0,
     status_requests: u64 = 0,
     action_requests: u64 = 0,
@@ -265,17 +274,18 @@ fn runService(app: *const App) i32 {
         return r4os.abi.service_api_result_no_endpoint;
     }
 
-    var state = ServiceState{};
+    var state = ServiceState{ .provider = network.provider(app.sys) catch 0 };
     setLastError(&state, "ready");
     var service_loop = r4os.ServiceLoop.init(app.sys, handle, .{});
     while (true) {
+        sweepNetworkOwners(app, &state);
         const pending_rc = processPending(app, handle, &state);
         if (pending_rc < 0) {
             cleanupService(app, handle, &state, "pending");
             _ = app.sys.serviceEndpointUnregister(handle);
             return pending_rc;
         }
-        const deadline = if (pendingCount(&state) != 0) app.sys.ticks() +| 1 else null;
+        const deadline: ?u64 = if (pendingCount(&state) != 0) app.sys.ticks() +| 1 else networkSweepDeadline(app, &state);
         switch (service_loop.wait(deadline)) {
             .requests => |pending| {
                 const rc = service_loop.drain(pending, handleLoopRequest, .{ app, handle, &state });
@@ -318,6 +328,7 @@ fn handleRequest(app: *const App, handle: u32, state: *ServiceState) i32 {
     state.requests +%= 1;
     const payload_len: usize = @intCast(got);
     const request = service_payload_buffer[0..payload_len];
+    if (header.op >= r4os.abi.network_op_info and header.op <= r4os.abi.network_op_release) return replyNetwork(app, handle, header.request_id, state, header.client_id, header.op, request);
     return switch (header.op) {
         r4os.abi.net_service_op_status => replyTextStatus(app, handle, header.request_id, state, header.client_id),
         r4os.abi.net_service_op_tcp_status_result => replyStatusResult(app, handle, header.request_id, state, header.client_id),
@@ -1874,6 +1885,7 @@ fn resolveFrontHandleForRelease(state: *ServiceState, handle: u32) FrontLookup {
 
 fn releaseFrontHandleAt(state: *ServiceState, index: usize) void {
     if (index >= state.handles.len) return;
+    if (state.handles[index].typed_generation != 0) state.typed_count -= 1;
     state.handles[index] = .{};
 }
 
@@ -2652,3 +2664,162 @@ const Writer = struct {
         return self.out[0..self.pos];
     }
 };
+
+fn replyNetwork(app: *const App, endpoint: u32, request_id: u32, state: *ServiceState, owner: u32, op: u16, payload: []const u8) i32 {
+    return networkRequest(app, endpoint, request_id, state, owner, op, payload) catch |err|
+        finishReply(state, app.sys.serviceEndpointReply(endpoint, request_id, network.code(err), ""));
+}
+fn networkRequest(app: *const App, endpoint: u32, request_id: u32, state: *ServiceState, owner: u32, op: u16, payload: []const u8) network.Error!i32 {
+    const a = r4os.abi;
+    if (state.provider == 0) return error.Backend;
+    if (op == a.network_op_info) {
+        if (payload.len != 0) return error.Invalid;
+        var info: a.NetworkProviderInfo = .{ .provider = state.provider };
+        if (network.backendInfo(app.net, a.ipc_channel_net_tcp)) |backend| {
+            const required = a.network_cap_ipv4 | a.network_cap_tcp | a.network_cap_retained_terminal;
+            if (backend.capabilities & required == required and backend.max_send != 0 and backend.max_recv != 0) {
+                info.capabilities = required;
+                info.max_send = backend.max_send;
+                info.max_recv = backend.max_recv;
+            }
+        }
+        return finishReply(state, app.sys.serviceEndpointReply(endpoint, request_id, 0, std.mem.asBytes(&info)));
+    }
+    if (op != a.network_op_connect and op != a.network_op_read and op != a.network_op_write and op != a.network_op_close) return error.UnsupportedPolicy;
+    if (payload.len < @sizeOf(a.NetworkSocketRequest)) return error.Invalid;
+    const req = try network.record(a.NetworkSocketRequest, payload[0..@sizeOf(a.NetworkSocketRequest)]);
+    if (req.provider != state.provider) return error.ProviderChanged;
+    try network.policy(req.flags);
+    const process = try network.owner(app.sys, owner);
+    const data = payload[@sizeOf(a.NetworkSocketRequest)..];
+    if (data.len != (if (op == a.network_op_write) req.bytes else @as(u32, 0))) return error.Invalid;
+    try network.checkAttempt(app.sys, req.deadline);
+    if (op == a.network_op_connect) {
+        const ip = try network.ipv4(req.endpoint, false);
+        if (std.mem.allEqual(u8, &ip, 0) or req.socket != 0 or req.generation != 0 or req.bytes != 0) return error.Invalid;
+        const backend = network.backendInfo(app.net, a.ipc_channel_net_tcp) orelse return error.Backend;
+        const required = a.network_cap_ipv4 | a.network_cap_tcp | a.network_cap_retained_terminal;
+        if (backend.capabilities & required != required or backend.max_send == 0 or backend.max_recv == 0) return error.Backend;
+        if (state.next_typed_generation == 0) return error.Capacity;
+        var free_front = false;
+        for (state.handles) |entry| {
+            if (!entry.used) {
+                free_front = true;
+                break;
+            }
+        }
+        if (!free_front) return error.Capacity;
+        const limit = try network.tickDeadline(app.sys, req.deadline);
+        var bytes: [6]u8 = undefined;
+        @memcpy(bytes[0..4], &ip);
+        writeLe16(&bytes, 4, req.endpoint.port);
+        const reply = backendResultWithDeadline(app, a.net_service_op_tcp_connect_retained_result, &bytes, limit, backend_result_data[0..]) orelse return error.Backend;
+        if (reply.result.result != 0 or reply.result.handle == 0 or reply.result.conn_id == 0) {
+            return if (reply.result.lifecycle_cause == a.net_service_socket_lifecycle_timeout) error.Timeout else error.Backend;
+        }
+        const front = allocateFrontHandle(state, owner, reply.result.handle, reply.result.conn_id) orelse {
+            closeBackendHandle(app, reply.result.handle);
+            return error.Capacity;
+        };
+        const lookup = resolveFrontHandle(state, front, owner);
+        const generation = state.next_typed_generation;
+        state.next_typed_generation = std.math.add(u64, generation, 1) catch 0;
+        state.handles[lookup.index].typed_generation = generation;
+        state.handles[lookup.index].typed_owner = process;
+        state.typed_count += 1;
+        state.handles[lookup.index].typed_endpoint = req.endpoint;
+        const out: a.NetworkSocketResult = .{ .provider = state.provider, .socket = front, .generation = generation, .endpoint = req.endpoint, .state = a.network_state_ready };
+        if (!network.ownerAlive(app.sys, process)) {
+            if (closeTypedBackend(app, reply.result.handle)) releaseFrontHandleAt(state, lookup.index);
+            return error.BadSocket;
+        }
+        const rc = app.sys.serviceEndpointReply(endpoint, request_id, 0, std.mem.asBytes(&out));
+        if (rc != 0 and closeTypedBackend(app, reply.result.handle)) releaseFrontHandleAt(state, lookup.index);
+        return finishReply(state, rc);
+    }
+    if (req.socket == 0 or req.socket > std.math.maxInt(u32) or req.generation == 0 or !std.mem.allEqual(u8, std.mem.asBytes(&req.endpoint), 0)) return error.Invalid;
+    var index: ?usize = null;
+    for (&state.handles, 0..) |entry, i| {
+        if (entry.used and entry.handle == req.socket and entry.typed_generation == req.generation and entry.owner_id == owner and entry.typed_owner.generation == process.generation) {
+            index = i;
+            break;
+        }
+    }
+    const slot = index orelse return error.BadSocket;
+    const entry = state.handles[slot];
+    var out: a.NetworkSocketResult = .{ .provider = state.provider, .socket = req.socket, .generation = req.generation, .endpoint = entry.typed_endpoint, .state = a.network_state_ready };
+    var input: [4096]u8 = undefined;
+    writeLe32(&input, 0, entry.backend_handle);
+    var body: []const u8 = "";
+    if (op == a.network_op_close) {
+        if (req.bytes != 0) return error.Invalid;
+        const reply = backendResult(app, a.net_service_op_tcp_close_result, input[0..4], backend_result_data[0..]) orelse return error.Backend;
+        if (reply.result.result < 0) return error.BadSocket;
+        releaseFrontHandleAt(state, slot);
+        out.state = a.network_state_local_closed;
+    } else if (req.bytes != 0) {
+        const reading = op == a.network_op_read;
+        if (req.bytes > (if (reading) @min(a.net_service_tcp_read_max, 4008) else @min(a.net_service_tcp_write_max, 3968))) return error.Capacity;
+        var count: usize = 4;
+        if (reading) {
+            writeLe16(&input, 4, @intCast(req.bytes));
+            count = 6;
+        } else {
+            @memcpy(input[4..][0..data.len], data);
+            count += data.len;
+        }
+        const reply = backendResult(app, if (reading) a.net_service_op_tcp_read_result else a.net_service_op_tcp_write_result, input[0..count], backend_result_data[0..]) orelse return error.Backend;
+        if (reply.result.conn_id != 0 and reply.result.conn_id != entry.conn_id) return error.BadSocket;
+        if (reply.result.result < 0) return if (reply.result.lifecycle_cause == a.net_service_socket_lifecycle_reset) error.Reset else if (reply.result.lifecycle_cause == a.net_service_socket_lifecycle_bad_handle) error.BadSocket else error.Backend;
+        if (reply.result.bytes > req.bytes) return error.Backend;
+        out.bytes = reply.result.bytes;
+        out.original_bytes = out.bytes;
+        if (out.bytes == 0) {
+            out.state = switch (reply.result.lifecycle_cause) {
+                a.net_service_socket_lifecycle_peer_gone => if (reading) a.network_state_eof else a.network_state_local_closed,
+                a.net_service_socket_lifecycle_reset => a.network_state_reset,
+                a.net_service_socket_lifecycle_would_block => a.network_state_would_block,
+                else => return error.Backend,
+            };
+        }
+        if (reading) {
+            if (reply.data.len != out.bytes) return error.Backend;
+            body = reply.data;
+        }
+    }
+    var response: [4096]u8 = undefined;
+    @memcpy(response[0..@sizeOf(a.NetworkSocketResult)], std.mem.asBytes(&out));
+    @memcpy(response[@sizeOf(a.NetworkSocketResult)..][0..body.len], body);
+    return finishReply(state, app.sys.serviceEndpointReply(endpoint, request_id, 0, response[0 .. @sizeOf(a.NetworkSocketResult) + body.len]));
+}
+
+// Poll only while new typed resources exist. Existing old-only service idle
+// waits remain unbounded. No process registry borrow spans backend work.
+fn sweepNetworkOwners(app: *const App, state: *ServiceState) void {
+    if (state.typed_count == 0 or app.sys.ticks() < state.typed_sweep_tick) return;
+    state.typed_sweep_tick = app.sys.ticks() +| app.sys.ticksFromMilliseconds(1000);
+    for (&state.handles, 0..) |entry, i| {
+        if (!entry.used or entry.typed_generation == 0 or !network.ownerGone(app.sys, entry.typed_owner)) continue;
+        var request: [4]u8 = undefined;
+        writeLe32(&request, 0, entry.backend_handle);
+        const reply = backendResult(app, r4os.abi.net_service_op_tcp_abort_result, &request, backend_result_data[0..]) orelse continue;
+        // Uncertain transport failure retains this bounded front entry until
+        // a later actual owner acknowledgement; it is no retirement proof.
+        if (reply.result.result == 0) releaseFrontHandleAt(state, i);
+    }
+}
+
+fn closeTypedBackend(app: *const App, backend_handle: u32) bool {
+    var request: [4]u8 = undefined;
+    writeLe32(&request, 0, backend_handle);
+    const reply = backendResult(app, r4os.abi.net_service_op_tcp_abort_result, &request, backend_result_data[0..]) orelse return false;
+    return reply.result.result == 0;
+}
+
+fn networkSweepDeadline(app: *const App, state: *const ServiceState) ?u64 {
+    if (state.typed_count == 0) return null;
+    // A missing logical frequency must not turn owner cleanup into a busy
+    // poll loop. Without it, retain resources and check on ordinary requests.
+    if (app.sys.ticksFromMilliseconds(1000) == 0) return null;
+    return state.typed_sweep_tick;
+}

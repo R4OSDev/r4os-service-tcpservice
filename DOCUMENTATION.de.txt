@@ -3,6 +3,31 @@
 
 TCPSVC.R4X ist der TCP-Verbindungsservice.
 
+Neue Familien-RPCs seit0.90.31 / TCPSVC0.1.10
+--------------------------------------------
+Der neue Query2-SDKzugang bedient INFO, CONNECT, READ, WRITE und CLOSE ueber
+denselben Serviceendpunkt und dieselben Front-/Backendressourcen. Normative
+Records und Semantik: Contract/API/NetworkFamily.txt. Vorhandene Query1-
+Aufrufe, Imports und Listener-/Deferredpfade bleiben erhalten.
+
+Neue Sockets binden Anbieterprozess, nie wiederverwendete Socketgeneration
+und genaue Aufrufer-Prozessgeneration. Der vorhandene TCP-Besitzer behaelt
+Peer-FIN und Reset bis zum expliziten Close getrennt, auch nach dem letzten
+Read. Ein fehlender Handle wird nie als EOF ausgegeben. Read/Write bestaetigen
+nur den angenommenen Bytepraefix; Caller behalten jeden Rest.
+
+Nur vorhandenes IPv4 ist freigegeben. IPv6, Dualstack, v4-mapped, explizite
+v4-Scope-/Interfacewahl und neue Listen-/Acceptoperationen werden noch nicht
+angeboten. INFO prueft die private Backendfaehigkeit; ein aelterer Kernel
+ohne Retentionsadapter darf diese neuen Faehigkeiten nicht vortaeuschen.
+Der bisherige Query1-Pfad bleibt dort eigenstaendig verfuegbar.
+
+Nur solange neue Sockets existieren, prueft der unveraenderte ServiceLoop
+deren genaue Besitzer in begrenzten1Sekundenabstaenden. Reales Prozessende
+oder exaktes Missing/Stale erlaubt Backendabort und anschliessende Freigabe.
+Busy/Unavailable und ungewisse Backendreturns behalten die gebundene Ressource.
+Das ist keine Appmigration und keine Ablösung des ServiceLoop.
+
 Seit 0.52.11 unterstuetzt der strukturierte TCP-Servicevertrag zusaetzlich
 `ACCEPT_POLL`: eine nicht-blockierende Accept-Abfrage auf einem bestehenden
 Listener. Dienste wie `RDPSVC.R4X` koennen damit eingehende Verbindungen
