@@ -42,3 +42,11 @@ and `NOTICE`. Any repository-specific external material is documented in
 
 Deferred write responses preserve the accepted byte count independently of
 the DATA flag. A header-only reply for a 3-of-8-byte write reports 3 bytes.
+
+## Family-aware provider path
+
+The copied Query2 network contract is served by the original endpoint and
+resource owners. The0.90.33 provider revision adds actual IPv6 transport and
+explicit wildcard dualstack where qualified; current limits and lifetimes
+are specified in Contract/API/Ipv6Transport.txt. Existing consumer imports
+and old operations retain their original path.
