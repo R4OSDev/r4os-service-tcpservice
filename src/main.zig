@@ -2381,7 +2381,17 @@ fn runSelfTest(app: *const App) i32 {
     const after_status = app.sys.serviceCall(handle, r4os.abi.net_service_op_tcp_status_result, "", &header, selftest_status_response[0..], app.sys.ticksFromMilliseconds(service_timeout_ms));
     if (after_status != @as(i32, @intCast(@sizeOf(r4os.abi.NetServiceTcpStatus))) or header.status != r4os.abi.service_api_result_ok) return fail(app, "after-status");
     copyStruct(&status, selftest_status_response[0..]);
-    if (status.active_listeners != 0 or status.handle_count != 0) return fail(app, "restart-cleanup");
+    if (status.magic != r4os.abi.net_service_tcp_status_magic or
+        status.version != r4os.abi.net_service_tcp_status_version or
+        status.owned_handles != 0) return fail(app, "restart-cleanup");
+
+    // Other services may already have re-registered their listeners. Probe
+    // the port held by this self-test before the restart.
+    const stale_listener = app.sys.serviceCall(handle, r4os.abi.net_service_op_tcp_accept_poll_result, listen_request[0..], &header, selftest_result_response[0..], app.sys.ticksFromMilliseconds(service_timeout_ms));
+    if (stale_listener != @as(i32, @intCast(@sizeOf(r4os.abi.NetServiceTcpResult))) or header.status != r4os.abi.service_api_result_ok) return fail(app, "restart-listener-probe");
+    copyStruct(&result, selftest_result_response[0..]);
+    if (result.result != r4os.abi.tcp_result_bad_state or result.conn_id != 0 or
+        result.flags & r4os.abi.net_service_tcp_flag_handle_valid != 0) return fail(app, "restart-listener-retained");
 
     var abort_request: [4]u8 = .{0} ** 4;
     writeLe32(abort_request[0..], 0, 0xCAFE1709);
