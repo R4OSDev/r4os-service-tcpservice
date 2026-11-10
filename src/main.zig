@@ -1231,14 +1231,14 @@ fn performListen(app: *const App, state: *ServiceState, owner_id: u32, op: u16, 
     const port = readLe16(request, 0);
     state.last_port = port;
     if (port == 0) return localError(app, state, op, 0, r4os.abi.net_service_result_bad_request, "bad-port");
-    if (listenerForPort(state, port)) |idx| {
+    const registered = listenerForPort(state, port);
+    if (registered) |idx| {
         if (!ownerMatches(state.listeners[idx].owner_id, owner_id)) return ownerMismatch(state, op, 0, port);
-        var out = localOkListener(app, state, op, port, "already-listening");
-        noteResult(state, &out.result);
-        return out;
     }
+    // Ownership can outlive the backend listener after a link change.
+    // Kernel listen is idempotent while that listener still exists.
     var reply = backendResult(app, op, request, data_out) orelse return backendError(app, state, op, "backend");
-    if (reply.result.result == 0 and (reply.result.flags & r4os.abi.net_service_tcp_flag_listener) != 0) {
+    if (registered == null and reply.result.result == 0 and (reply.result.flags & r4os.abi.net_service_tcp_flag_listener) != 0) {
         if (!rememberListener(state, owner_id, port)) {
             _ = backendResult(app, r4os.abi.net_service_op_tcp_close_listen_result, request, data_out);
             return localError(app, state, op, 0, -2, "listener-full");

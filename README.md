@@ -50,6 +50,9 @@ as its numeric socket identity. After a TCPSVC restart, a pending operation
 using an old handle cannot address a new connection. Family requests retain
 their provider, socket and generation checks; broker-only IDs occupy a
 separate range from the older numeric handles.
+Repeated listen by the port owner asks the kernel again. This restores the
+listener when a link change removed it while the service's port record
+remained active.
 
 The copied Query2 network contract is served by the original endpoint and
 resource owners. The0.90.33 provider revision adds actual IPv6 transport and
