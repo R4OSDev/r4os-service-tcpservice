@@ -45,6 +45,12 @@ the DATA flag. A header-only reply for a 3-of-8-byte write reports 3 bytes.
 
 ## Family-aware provider path
 
+The older IPv4 request format keeps the kernel's nonreused connection handle
+as its numeric socket identity. After a TCPSVC restart, a pending operation
+using an old handle cannot address a new connection. Family requests retain
+their provider, socket and generation checks; broker-only IDs occupy a
+separate range from the older numeric handles.
+
 The copied Query2 network contract is served by the original endpoint and
 resource owners. The0.90.33 provider revision adds actual IPv6 transport and
 explicit wildcard dualstack where qualified; current limits and lifetimes

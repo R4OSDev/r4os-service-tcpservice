@@ -124,7 +124,7 @@ const ServiceState = struct {
     max_request_ticks: u64 = 0,
     long_requests: u64 = 0,
     request_ticks_total: u64 = 0,
-    next_handle: u32 = 1,
+    next_typed_only_handle: u32 = std.math.maxInt(u32),
     next_generation: u32 = 1,
     handles: [front_handles_max]FrontHandle = .{FrontHandle{}} ** front_handles_max,
     listeners: [listeners_max]Listener = .{Listener{}} ** listeners_max,
@@ -520,7 +520,7 @@ fn shouldDeferWrite(result: *const r4os.abi.NetServiceTcpResult, request: []cons
 fn startDeferredRead(app: *const App, state: *ServiceState, request_id: u32, owner_id: u32, request: []const u8, requested_deadline: ?u64, initial: *r4os.abi.NetServiceTcpResult) bool {
     if (requested_deadline == r4os.service_deadline.tcp_poll_tick) return false;
     const front_handle = readLe32(request, 0);
-    const lookup = resolveFrontHandle(state, front_handle, owner_id);
+    const lookup = resolveLegacyFrontHandle(state, front_handle, owner_id);
     if (!lookup.ok) return false;
     const now = app.sys.ticks();
     const deadline = deferredDeadline(app, requested_deadline, deferred_read_timeout_ms);
@@ -581,7 +581,7 @@ fn startDeferredWrite(app: *const App, state: *ServiceState, request_id: u32, ow
         markDeferredWouldBlock(initial, front_handle, "pending-too-large");
         return false;
     }
-    const lookup = resolveFrontHandle(state, front_handle, owner_id);
+    const lookup = resolveLegacyFrontHandle(state, front_handle, owner_id);
     if (!lookup.ok) return false;
     const now = app.sys.ticks();
     const deadline = deferredDeadline(app, requested_deadline, deferred_write_timeout_ms);
@@ -1125,7 +1125,7 @@ fn performWriteOperation(app: *const App, state: *ServiceState, owner_id: u32, o
     if (request.len < 4) return localError(app, state, op, 0, r4os.abi.net_service_result_bad_request, "bad-request");
     if (request.len > r4os.abi.net_service_tcp_message_payload_max) return localError(app, state, op, 0, r4os.abi.net_service_result_bad_request, "too-large");
     const front_handle = readLe32(request, 0);
-    const lookup = resolveFrontHandle(state, front_handle, owner_id);
+    const lookup = resolveLegacyFrontHandle(state, front_handle, owner_id);
     if (!lookup.ok) return localError(app, state, op, front_handle, lookup.result, lookup.last_error);
     const requested_len = request.len - 4;
     if (requested_len > r4os.abi.net_service_tcp_write_max) return localError(app, state, op, front_handle, r4os.abi.net_service_result_bad_request, "too-large");
@@ -1158,7 +1158,7 @@ fn performWriteOperation(app: *const App, state: *ServiceState, owner_id: u32, o
 fn performHandleOperation(app: *const App, state: *ServiceState, owner_id: u32, op: u16, request: []const u8, data_out: []u8, release_on_success: bool) TcpReply {
     if (request.len < 4) return localError(app, state, op, 0, r4os.abi.net_service_result_bad_request, "bad-request");
     const front_handle = readLe32(request, 0);
-    var lookup = resolveFrontHandle(state, front_handle, owner_id);
+    var lookup = resolveLegacyFrontHandle(state, front_handle, owner_id);
     if (!lookup.ok and release_on_success and lookup.result == owner_mismatch_result) {
         lookup = resolveFrontHandleForRelease(state, front_handle);
     }
@@ -1183,7 +1183,7 @@ fn performHandleOperation(app: *const App, state: *ServiceState, owner_id: u32, 
 fn performCloseOperation(app: *const App, state: *ServiceState, owner_id: u32, op: u16, request: []const u8, data_out: []u8) TcpReply {
     if (request.len < 4) return localError(app, state, op, 0, r4os.abi.net_service_result_bad_request, "bad-request");
     const front_handle = readLe32(request, 0);
-    var lookup = resolveFrontHandle(state, front_handle, owner_id);
+    var lookup = resolveLegacyFrontHandle(state, front_handle, owner_id);
     if (!lookup.ok and lookup.result == owner_mismatch_result) {
         lookup = resolveFrontHandleForRelease(state, front_handle);
     }
@@ -1849,7 +1849,17 @@ fn allocateFrontHandle(state: *ServiceState, owner_id: u32, backend_handle: u32,
     i = 0;
     while (i < state.handles.len) : (i += 1) {
         if (state.handles[i].used) continue;
-        const handle = nextFrontHandle(state);
+        // The kernel TCP handle is monotonic until exhaustion, including
+        // across TCPSVC restarts. A fresh provider must not recycle a
+        // service handle that an older remote worker can still present.
+        // Legacy callers also return handles through a positive i32.
+        const handle = if (backend_handle != 0) blk: {
+            if (backend_handle > std.math.maxInt(i32)) return null;
+            for (state.handles) |entry| {
+                if (entry.used and entry.handle == backend_handle) return null;
+            }
+            break :blk backend_handle;
+        } else nextTypedOnlyHandle(state) orelse return null;
         const generation = nextHandleGeneration(state);
         state.handles[i] = .{
             .used = true,
@@ -1864,10 +1874,10 @@ fn allocateFrontHandle(state: *ServiceState, owner_id: u32, backend_handle: u32,
     return null;
 }
 
-fn nextFrontHandle(state: *ServiceState) u32 {
-    const handle = state.next_handle;
-    state.next_handle +%= 1;
-    if (state.next_handle == 0) state.next_handle = 1;
+fn nextTypedOnlyHandle(state: *ServiceState) ?u32 {
+    const handle = state.next_typed_only_handle;
+    if (handle <= std.math.maxInt(i32)) return null;
+    state.next_typed_only_handle -= 1;
     return handle;
 }
 
@@ -1893,13 +1903,22 @@ fn resolveFrontHandle(state: *ServiceState, handle: u32, owner_id: u32) FrontLoo
 }
 
 fn resolveFrontHandleForRelease(state: *ServiceState, handle: u32) FrontLookup {
+    if (handle > std.math.maxInt(i32)) return .{ .result = r4os.abi.tcp_result_no_connection, .last_error = "no-connection" };
     var i: usize = 0;
     while (i < state.handles.len) : (i += 1) {
         const entry = state.handles[i];
-        if (!entry.used or entry.handle != handle) continue;
+        if (!entry.used or entry.handle != handle or entry.typed_generation != 0) continue;
         return .{ .ok = true, .index = i, .entry = entry, .result = 0, .last_error = "" };
     }
     return .{ .result = r4os.abi.tcp_result_no_connection, .last_error = "no-connection" };
+}
+
+fn resolveLegacyFrontHandle(state: *ServiceState, handle: u32, owner_id: u32) FrontLookup {
+    if (handle > std.math.maxInt(i32)) return .{ .result = r4os.abi.tcp_result_no_connection, .last_error = "no-connection" };
+    const lookup = resolveFrontHandle(state, handle, owner_id);
+    if (lookup.ok and lookup.entry.typed_generation != 0)
+        return .{ .result = r4os.abi.tcp_result_no_connection, .last_error = "no-connection" };
+    return lookup;
 }
 
 fn releaseFrontHandleAt(state: *ServiceState, index: usize) void {
