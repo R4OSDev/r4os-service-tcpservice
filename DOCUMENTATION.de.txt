@@ -138,3 +138,20 @@ Release-/Rueckgabequittung. Die Besitzer von Socket, Resolverpages und
 Transportressourcen werden durch diese Verbrauchermigration nicht ersetzt.
 Quellen, Normalbau, Laufzeitumfang und Grenzen: Research/API-ABI/Migration/
 0.90.60/Abnahme.json im lokalen Workspace; Projektbericht unter Docs/API/.
+
+
+Listener-Neustart ab Migration0.90.70 / TCPSVC0.1.14
+-------------------------------------------------
+Ein neuer familienfaehiger Listen-Aufruf prueft vorhandene typisierte
+Listener desselben Ports zusaetzlich vor der Admission. Die genaue gespeicherte
+Prozessgeneration muss terminal, fehlend oder stale bestaetigt sein. Dann
+wird der bestehende retireNetworkSocket-Pfad verwendet. Erst dessen wirkliche
+Backendquittung erlaubt die Freigabe des Frontendeintrags. Busy, unklarer
+Besitzerstatus und unquittierter Backendabbau behalten die Ressource.
+Nach dieser Bereinigungsphase wird die urspruengliche Aufruffrist erneut
+geprueft. Weitere Admission verwendet denselben bestehenden Fristwert.
+Der begrenzte periodische Besitzercheck bedient die uebrigen aufgegebenen
+Sockets weiterhin. Ein aktiver Listener behaelt seine genaue Ownership.
+Die normale Prozessquittung und die externe Socketquittung haben jeweils
+ihren eigenen Besitzer. Die SMP4-Probe prueft Kill und sofortigen Neustart
+am selben Port sowie die Verweigerung einer zweiten lebenden Ownership.

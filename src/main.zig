@@ -2933,6 +2933,16 @@ fn networkCreate(app: *const App, endpoint: u32, request_id: u32, state: *Servic
     if (req.endpoint.address.family != 4 and !v6) return error.UnsupportedFamily;
     if (req.flags != 0 and !(v6 and listening and req.flags == a.network_policy_dual_stack and transport.zero(req.endpoint.address) and req.endpoint.address.scope_id == 0)) return error.UnsupportedPolicy;
     if (!listening and req.deadline.kind == 0) return error.WouldBlock;
+    if (listening) {
+        // A reaped client can leave its listener until the periodic sweep.
+        // Reclaim an exact abandoned owner before the same-port admission.
+        for (&state.handles, 0..) |entry, index| {
+            if (!entry.used or !entry.typed_listener or entry.typed_endpoint.port != req.endpoint.port or
+                !network.ownerGone(app.sys, entry.typed_owner)) continue;
+            if (retireNetworkSocket(app, state, index)) releaseFrontHandleAt(state, index);
+        }
+        try network.checkAttempt(app.sys, req.deadline);
+    }
     if (!networkHasSpace(state)) return error.Capacity;
     if (!listening and (pendingCount(state) >= pendingActiveLimit() or pendingCountForOwner(state, owner.instance_id) >= pending_per_owner_max)) return error.Capacity;
     const pending_slot: ?usize = if (!listening) allocatePendingSlot(state) orelse return error.Capacity else null;
