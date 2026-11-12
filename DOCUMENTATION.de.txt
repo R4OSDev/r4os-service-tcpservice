@@ -155,3 +155,18 @@ Sockets weiterhin. Ein aktiver Listener behaelt seine genaue Ownership.
 Die normale Prozessquittung und die externe Socketquittung haben jeweils
 ihren eigenen Besitzer. Die SMP4-Probe prueft Kill und sofortigen Neustart
 am selben Port sowie die Verweigerung einer zweiten lebenden Ownership.
+
+
+Begrenzte Servicefortsetzungen ab0.90.80 / TCPSVC0.1.15
+---------------------------------------------------
+Der ereignisgesteuerte TCP-Dispatcher fordert vor seiner Arbeit die bestehende
+Preferred-Klasse mit unveraenderter Standard-CPU-Menge an. Nach einem echten
+Yield werden angewendete Revision, Klasse und fehlendes Pending geprueft.
+Ein Fehler beendet den bisherigen Start-/Verbindungsabbaupfad definiert.
+Die Klasse verwendet nur das vorhandene begrenzte ShortCompletion-Budget
+von4Ticks/4Dispatches je Aktivierung; sie erzeugt keine Dauerprioritaet.
+TCP-Dispatcher und SSH-Sitzungsfortsetzung liegen gemeinsam auf dem
+fristgebundenen Netzwerkpfad und benoetigen beide diese Einordnung.
+BSP-/Workerzulassung, Protokollfristen, PCM-Budgets, Wireformate und echte
+Stop-/Joinquittungen bleiben erhalten. Diagnose-OpCodes und Messzaehler
+der lokalen Ursachenanalyse gehoeren nicht zur Serviceimplementierung.

@@ -260,7 +260,34 @@ pub fn r4_app_main(r4_app: *r4os.App2) i32 {
     return runService(&app);
 }
 
+fn configureDispatcherScheduling(app: *const App) i32 {
+    // TCP dispatch is on the finite-deadline path of several independent
+    // clients. Use the existing bounded completion class without changing
+    // CPU admission, caller deadlines or the scheduler's fairness budget.
+    var dispatcher: r4os.abi.ProgramJoinHandle = .{};
+    const current_result = app.sys.threadCurrentHandle(&dispatcher);
+    if (current_result != r4os.abi.thread_ok) return current_result;
+    const request = r4os.abi.ThreadPlacementRequest{
+        .flags = r4os.abi.thread_placement_flag_default_cpus,
+        .work_class = r4os.abi.thread_placement_class_preferred,
+    };
+    const set_result = app.sys.threadPlacementSet(&dispatcher, &request, &.{});
+    if (set_result != r4os.abi.thread_ok) return set_result;
+    // The current thread adopts placement only after its context is saved.
+    app.sys.taskYield();
+    var applied: r4os.abi.ThreadPlacementInfo = .{};
+    const get_result = app.sys.threadPlacementGet(&dispatcher, &applied, &.{});
+    if (get_result != r4os.abi.thread_ok) return get_result;
+    if (applied.work_class != r4os.abi.thread_placement_class_preferred or
+        applied.request_revision != applied.applied_revision or
+        (applied.flags & r4os.abi.thread_placement_flag_pending) != 0)
+        return r4os.abi.thread_error_busy;
+    return r4os.abi.thread_ok;
+}
+
 fn runService(app: *const App) i32 {
+    const scheduling_result = configureDispatcherScheduling(app);
+    if (scheduling_result != r4os.abi.thread_ok) return scheduling_result;
     if (!app.sys.hasFn("service_call")) return r4os.abi.service_api_result_invalid;
 
     var info: r4os.abi.ServiceInfo = .{};
